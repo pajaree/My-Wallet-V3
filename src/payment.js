@@ -9,6 +9,7 @@ var KeyRing = require('./keyring');
 var EventEmitter = require('events');
 var util = require('util');
 var constants = require('./constants');
+var mapObjIndexed = require('ramda/src/mapObjIndexed');
 
 // Payment Class
 
@@ -16,38 +17,7 @@ function Payment (wallet, payment) {
   EventEmitter.call(this);
   this._wallet = wallet;
 
-  var serverFeeFallback = {
-    'default': {
-      'fee': 35000.00,
-      'surge': false,
-      'ok': true
-    },
-    'estimate': [{
-      'fee': 45000.0,
-      'surge': false,
-      'ok': true
-    }, {
-      'fee': 35000.00,
-      'surge': false,
-      'ok': true
-    }, {
-      'fee': 22000.0,
-      'surge': false,
-      'ok': true
-    }, {
-      'fee': 19000.0,
-      'surge': false,
-      'ok': true
-    }, {
-      'fee': 15000.0,
-      'surge': false,
-      'ok': true
-    }, {
-      'fee': 12000.0,
-      'surge': false,
-      'ok': true
-    }]
-  };
+  var serverFeeFallback = constants.SERVER_FEE_FALLBACK;
 
   var initialState = {
     fees: serverFeeFallback,  // fallback for fee-service
@@ -56,18 +26,19 @@ function Payment (wallet, payment) {
     from: null, // origin
     amounts: [], // list of amounts to spend entered in the form
     to: [], // list of destinations entered in the form
-    feePerKb: serverFeeFallback.default.fee, // default fee-per-kb used in basic send
+    feePerKb: Helpers.toFeePerKb(serverFeeFallback.regular), // default fee-per-kb used
     extraFeeConsumption: 0, // if there is change consumption to fee will be reflected here
     sweepFee: 0,  // computed fee to sweep an account in basic send (depends on fee-per-kb)
     sweepAmount: 0, // computed max spendable amount depending on fee-per-kb
     balance: 0, // sum of all unspents values with any filtering     [ payment.sumOfCoins ]
     finalFee: 0, // final absolute fee that it is going to be used no matter how was obtained (advanced or regular send)
     changeAmount: 0, // final change
-    absoluteFeeBounds: [0, 0, 0, 0, 0, 0], // fee bounds (absolute) per fixed amount
-    sweepFees: [0, 0, 0, 0, 0, 0], // sweep absolute fee per each fee per kb (1, 2, 3, 4, 5, 6)
-    maxSpendableAmounts: [0, 0, 0, 0, 0, 0],  // max amount per each fee-per-kb
-    confEstimation: 'unknown',
-    txSize: 0 // transaciton size
+    maxFees: {limits: { 'min': 0, 'max': 0 }, regular: 0, priority: 0}, // each fee-per-kb (regular, priority)
+    maxSpendableAmounts: {limits: { 'min': 0, 'max': 0 }, regular: 0, priority: 0},  // max amount for each fee-per-kb
+    txSize: 0, // transaction size
+    blockchainFee: 0,
+    blockchainAddress: null,
+    serviceChargeOptions: {}
   };
 
   var p = payment || initialState;
@@ -99,11 +70,12 @@ Payment.prototype.from = function (origin, absoluteFee) {
 
 Payment.prototype.fee = function (absoluteFee) {
   this.then(Payment.prebuild(absoluteFee));
+  this.sideEffect(this.emit.bind(this, 'update'));
   return this;
 };
 
-Payment.prototype.amount = function (amounts, absoluteFee) {
-  this.payment = this.payment.then(Payment.amount(amounts, absoluteFee));
+Payment.prototype.amount = function (amounts, absoluteFee, bFeeParams) {
+  this.payment = this.payment.then(Payment.amount(amounts, absoluteFee, bFeeParams));
   this.then(Payment.prebuild(absoluteFee));
   return this;
 };
@@ -137,14 +109,20 @@ Payment.prototype.updateFees = function () {
   return this;
 };
 
+Payment.prototype.updateFeePerKb = function (fee) {
+  this.payment = this.payment.then(Payment.updateFeePerKb(fee));
+  this.then(Payment.prebuild());
+  return this;
+};
+
 Payment.prototype.prebuild = function (absoluteFee) {
   this.payment = this.payment.then(Payment.prebuild(absoluteFee));
   this.sideEffect(this.emit.bind(this, 'update'));
   return this;
 };
 
-Payment.prototype.build = function () {
-  this.payment = this.payment.then(Payment.build.call(this));
+Payment.prototype.build = function (feeToMiners) {
+  this.payment = this.payment.then(Payment.build.call(this, feeToMiners));
   this.sideEffect(this.emit.bind(this, 'update'));
   return this;
 };
@@ -229,7 +207,7 @@ Payment.useAll = function (absoluteFee) {
   };
 };
 
-Payment.amount = function (amounts, absoluteFee) {
+Payment.amount = function (amounts, absoluteFee, feeOptions) {
   var formatAmo = null;
   switch (true) {
     // single output
@@ -246,6 +224,10 @@ Payment.amount = function (amounts, absoluteFee) {
       console.log('No amounts set.');
   } // fi switch
   return function (payment) {
+    payment.serviceChargeOptions = feeOptions || {};
+    payment.blockchainFee = feeOptions
+      ? Helpers.blockchainFee(formatAmo.reduce(Helpers.add, 0), feeOptions)
+      : 0;
     payment.amounts = formatAmo;
     return Promise.resolve(payment);
   };
@@ -350,18 +332,28 @@ Payment.from = function (origin) {
 Payment.updateFees = function () {
   return function (payment) {
     return API.getFees().then(
-          function (fees) {
-            payment.fees = fees;
-            payment.feePerKb = fees.default.fee;
-            return payment;
-          }
-        ).catch(
-          // this could fail for network issues - fallback default fee
-          function (error) {
-            console.log(error);
-            return payment;
-          }
-        );
+      function (fees) {
+        payment.fees = fees;
+        payment.feePerKb = Helpers.toFeePerKb(fees.regular);
+        return payment;
+      }
+    ).catch(
+      // this could fail for network issues - fallback default fee
+      function (error) {
+        console.log(error);
+        return payment;
+      }
+    );
+  };
+};
+
+Payment.updateFeePerKb = function (fee) {
+  return function (payment) {
+    if (['regular', 'priority'].indexOf(fee) > -1) {
+      fee = payment.fees[fee];
+    }
+    payment.feePerKb = Helpers.toFeePerKb(fee);
+    return Promise.resolve(payment);
   };
 };
 
@@ -371,61 +363,64 @@ Payment.prebuild = function (absoluteFee) {
 
     var usableCoins = Transaction.filterUsableCoins(payment.coins, payment.feePerKb);
     var max = Transaction.maxAvailableAmount(usableCoins, payment.feePerKb);
-    payment.sweepAmount = max.amount;
+    payment.sweepAmount = Helpers.balanceMinusFee(max.amount, payment.serviceChargeOptions);
     payment.sweepFee = max.fee;
     payment.balance = Transaction.sumOfCoins(payment.coins);
 
     // compute max spendable limits per each fee-per-kb
-    var maxSpendablesPerFeePerKb = function (e) {
-      var c = Transaction.filterUsableCoins(payment.coins, e.fee);
-      var s = Transaction.maxAvailableAmount(c, e.fee);
+    var maxSpendablesPerFeePerKb = function (fee, key) {
+      var c = Transaction.filterUsableCoins(payment.coins, Helpers.toFeePerKb(fee));
+      var s = Transaction.maxAvailableAmount(c, Helpers.toFeePerKb(fee));
       return s.amount;
     };
-    payment.maxSpendableAmounts = payment.fees.estimate.map(maxSpendablesPerFeePerKb);
-    payment.sweepFees = payment.maxSpendableAmounts.map(function (v) { return payment.balance - v; });
 
-    // if amounts defined refresh computations
-    if (Array.isArray(payment.amounts) && payment.amounts.length > 0) {
-      // coin selection
-      var s;
-      if (Helpers.isPositiveNumber(absoluteFee)) {
-        s = Transaction.selectCoins(payment.coins, payment.amounts, absoluteFee, true);
-      } else {
-        s = Transaction.selectCoins(usableCoins, payment.amounts, payment.feePerKb, false);
-      }
-      payment.finalFee = s.fee;
-      payment.selectedCoins = s.coins;
-      payment.txSize = Transaction.guessSize(payment.selectedCoins.length, payment.amounts.length + 1);
-      var c = Transaction.sumOfCoins(payment.selectedCoins) - payment.amounts.reduce(Helpers.add, 0) - payment.finalFee;
-      payment.changeAmount = c > 0 ? c : 0;
+    var maxFees = function (fee, key) { return payment.balance - fee; };
 
-      // change consumption
-      if (payment.changeAmount > 0 && payment.changeAmount < dust) {
-        payment.extraFeeConsumption = payment.changeAmount;
-        payment.changeAmount = 0;
-      } else {
-        payment.extraFeeConsumption = 0;
-      }
+    payment.maxSpendableAmounts = mapObjIndexed(maxSpendablesPerFeePerKb, payment.fees);
+    payment.maxFees = mapObjIndexed(maxFees, payment.maxSpendableAmounts);
 
-      // compute absolute fee bounds for 1,2,3,4,5,6 block confirmations
-      var toAbsoluteFee = function (e) {
-        var c = Transaction.filterUsableCoins(payment.coins, e.fee);
-        var s = Transaction.selectCoins(c, payment.amounts, e.fee, false);
-        return s.fee;
-      };
-      payment.absoluteFeeBounds = payment.fees.estimate.map(toAbsoluteFee);
+    // coin selection
+    var amounts = payment.blockchainFee > 0
+      ? payment.amounts.concat(payment.blockchainFee)
+      : payment.amounts;
+    var s = Helpers.isPositiveNumber(absoluteFee)
+      ? Transaction.selectCoins(payment.coins, amounts, absoluteFee, true)
+      : Transaction.selectCoins(usableCoins, amounts, payment.feePerKb, false);
+    payment.finalFee = s.fee;
+    payment.selectedCoins = s.coins;
+    payment.txSize = Transaction.guessSize(payment.selectedCoins.length, (amounts.length || 1) + 1);
+    var c = Transaction.sumOfCoins(payment.selectedCoins) - amounts.reduce(Helpers.add, 0) - payment.finalFee;
+    payment.changeAmount = c > 0 ? c : 0;
 
-      // estimation of confirmation in number of blocks
-      payment.confEstimation = Transaction.confirmationEstimation(payment.absoluteFeeBounds, payment.finalFee);
+    // change consumption
+    if (payment.changeAmount > 0 && payment.changeAmount < dust) {
+      payment.extraFeeConsumption = payment.changeAmount;
+      payment.changeAmount = 0;
+    } else {
+      payment.extraFeeConsumption = 0;
     }
 
     return Promise.resolve(payment);
   };
 };
 
-Payment.build = function () {
+Payment.build = function (feeToMiners) {
+  // feeToMiners :: boolean (if true blockchain fee is given to the miners)
   return function (payment) {
     try {
+      if (payment.blockchainFee > 0) {
+        if (feeToMiners === true) {
+          payment.finalFee += payment.blockchainFee;
+        } else {
+          return API.getBlockchainAddress().then(function (object) {
+            payment.blockchainAddress = object.address;
+            payment.transaction = new Transaction(payment, this);
+            return payment;
+          }.bind(this)).catch(function (e) {
+            return Promise.reject({ error: e, payment: payment });
+          });
+        }
+      }
       payment.transaction = new Transaction(payment, this);
       return Promise.resolve(payment);
     } catch (e) {

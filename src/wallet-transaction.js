@@ -2,6 +2,7 @@
 
 module.exports = Tx;
 
+var { assoc } = require('ramda');
 var MyWallet = require('./wallet');
 
 function Tx (object) {
@@ -26,7 +27,8 @@ function Tx (object) {
   this.rbf = obj.rbf;
   this.publicNote = obj.note;
   this.note = MyWallet.wallet.getNote(this.hash);
-  this.confirmations = Tx.setConfirmations(this.block_height);
+  this.confirmations = Tx.setConfirmations(this.block_height, MyWallet.wallet.latestBlock);
+  this.coinCode = obj.coinCode || 'btc';
 
   // computed properties
   var initialIn = {
@@ -155,41 +157,45 @@ function address (x) {
   return MyWallet.wallet.key(x.addr);
 }
 
+function receiveIndex (x) {
+  if (!x || !x.xpub || !x.xpub.path) return;
+  if (!x.xpub.path.split('/').length === 3) return;
+  return parseInt(x.xpub.path.substr(1).split('/')[2]);
+}
+
 function tagCoin (x) {
-  var ad = x.addr;
-  var am = x.value;
-  var coinType = null;
-  var change = false;
-  var id;
-  var label = null;
-  var isWatchOnly = null;
+  let result = {
+    address: x.addr,
+    amount: x.value,
+    change: false,
+    coinType: null,
+    label: null,
+    isWatchOnly: null,
+    identity: undefined
+  };
 
   switch (true) {
     case isLegacy(x):
-      coinType = 'legacy';
-      id = 'imported';
+      result.coinType = 'legacy';
+      result.identity = 'imported';
       var addr = address(x);
-      label = addr.label;
-      isWatchOnly = addr.isWatchOnly;
+      result.label = addr.label;
+      result.isWatchOnly = addr.isWatchOnly;
       break;
     case isAccount(x):
-      coinType = accountPath(x);
-      change = isAccountChange(x);
-      id = account(x).index;
-      label = account(x).label;
+      result.coinType = accountPath(x);
+      result.change = isAccountChange(x);
+      result.identity = account(x).index;
+      result.label = account(x).label;
+      result.accountIndex = account(x).index;
+      if (!result.change) {
+        result.receiveIndex = receiveIndex(x);
+      }
       break;
     default:
-      coinType = 'external';
+      result.coinType = 'external';
   }
-  return {
-    address: ad,
-    amount: am,
-    coinType: coinType,
-    change: change,
-    label: label,
-    identity: id,
-    isWatchOnly: isWatchOnly
-  };
+  return result;
 }
 
 function unpackInput (input) {
@@ -280,9 +286,10 @@ function isCoinBase (input) {
   return (input == null || input.prev_out == null || input.prev_out.addr == null);
 }
 
-Tx.factory = function (o) {
+Tx.factory = function (o, coinCode) {
   if (o instanceof Object && !(o instanceof Tx)) {
-    return new Tx(o);
+    let setCoinCode = assoc('coinCode', coinCode === 'bch' ? 'bch' : 'btc');
+    return new Tx(setCoinCode(o));
   } else { return o; }
 };
 
@@ -306,8 +313,7 @@ Tx.IOSfactory = function (tx) {
   };
 };
 
-Tx.setConfirmations = function (txBlockHeight) {
-  var lastBlock = MyWallet.wallet.latestBlock;
+Tx.setConfirmations = function (txBlockHeight, lastBlock) {
   var conf = 0;
   if (lastBlock && txBlockHeight != null && txBlockHeight > 0) {
     conf = lastBlock.height - txBlockHeight + 1;

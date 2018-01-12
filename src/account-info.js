@@ -11,6 +11,7 @@ function AccountInfo (object) {
   this.mobile = object.sms_number;
 
   this._countryCodeGuess = object.country_code; // Country guess by the backend
+  this._stateCodeGuess = object.state; // State guess by the backend
   this._dialCode = object.dial_code; // Dialcode guess by the backend
 
   this._isEmailVerified = Boolean(object.email_verified);
@@ -56,7 +57,7 @@ Object.defineProperties(AccountInfo.prototype, {
       if (value && value.length > 5) {
         this._mobile = {
           countryCode: value.split(' ')[0].substr(1),
-          number: value.split(' ')[1]
+          number: value.split(' ')[1] || ''
         };
       } else {
         this._mobile = null;
@@ -66,6 +67,10 @@ Object.defineProperties(AccountInfo.prototype, {
   'countryCodeGuess': {
     configurable: false,
     get: function () { return this._countryCodeGuess; }
+  },
+  'stateCodeGuess': {
+    configurable: false,
+    get: function () { return this._stateCodeGuess; }
   },
   'dialCode': {
     configurable: false,

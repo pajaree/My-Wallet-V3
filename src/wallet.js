@@ -1,7 +1,6 @@
-'use strict';
-
 var MyWallet = module.exports = {};
 
+var WebSocket = require('ws');
 var assert = require('assert');
 var Buffer = require('buffer').Buffer;
 var WalletStore = require('./wallet-store');
@@ -12,19 +11,24 @@ var API = require('./api');
 var Wallet = require('./blockchain-wallet');
 var Helpers = require('./helpers');
 var BlockchainSocket = require('./blockchain-socket');
-var RNG = require('./rng');
+var RNG = require('./rng.js');
 var BIP39 = require('bip39');
 var Bitcoin = require('bitcoinjs-lib');
 var pbkdf2 = require('pbkdf2');
 var constants = require('./constants');
+var range = require('ramda/src/range');
 
 var isInitialized = false;
 MyWallet.wallet = undefined;
-MyWallet.ws = new BlockchainSocket();
+MyWallet.ws = new BlockchainSocket(null, WebSocket);
 
 // used locally and overridden in iOS
 MyWallet.socketConnect = function () {
-  MyWallet.ws.connect(onOpen, onMessage, onClose);
+  let socket = MyWallet.ws;
+  socket.on('open', onOpen);
+  socket.on('message', onMessage);
+  socket.on('close', onClose);
+  socket.connect();
 
   var lastOnChange = { checksum: null };
 
@@ -34,7 +38,7 @@ MyWallet.socketConnect = function () {
 
   function onOpen () {
     WalletStore.sendEvent('ws_on_open');
-    MyWallet.ws.send(MyWallet.getSocketOnOpenMessage());
+    socket.send(MyWallet.getSocketOnOpenMessage());
   }
 
   function onClose () {
@@ -52,10 +56,6 @@ function didDecryptWallet (success) {
 // called by native websocket in iOS
 MyWallet.getSocketOnMessage = function (message, lastOnChange) {
   var obj = null;
-
-  if (!(typeof window === 'undefined') && message.data) {
-    message = message.data;
-  }
   try {
     obj = JSON.parse(message);
   } catch (e) {
@@ -65,7 +65,7 @@ MyWallet.getSocketOnMessage = function (message, lastOnChange) {
 
   if (obj.op === 'on_change') {
     var oldChecksum = WalletStore.generatePayloadChecksum();
-    var newChecksum = obj.checksum;
+    var newChecksum = obj.x.checksum;
 
     if (lastOnChange.checksum !== newChecksum && oldChecksum !== newChecksum) {
       lastOnChange.checksum = newChecksum;
@@ -79,7 +79,7 @@ MyWallet.getSocketOnMessage = function (message, lastOnChange) {
     var sendOnTx = WalletStore.sendEvent.bind(null, 'on_tx');
     MyWallet.wallet.getHistory().then(sendOnTx);
   } else if (obj.op === 'block') {
-    if (obj.x.prevBlockIndex !== MyWallet.wallet.latestBlock.blockIndex && MyWallet.wallet.latestBlock.blockIndex !== 0) {
+    if (MyWallet.wallet.latestBlock && obj.x.prevBlockIndex !== MyWallet.wallet.latestBlock.blockIndex && MyWallet.wallet.latestBlock.blockIndex !== 0) {
       // there is a reorg
       MyWallet.wallet.getHistory();
     } else {
@@ -91,8 +91,6 @@ MyWallet.getSocketOnMessage = function (message, lastOnChange) {
       MyWallet.wallet.txList._transactions.forEach(up);
     }
     WalletStore.sendEvent('on_block');
-  } else if (obj.op === 'pong') {
-    clearTimeout(MyWallet.ws.pingTimeoutPID);
   } else if (obj.op === 'email_verified') {
     MyWallet.wallet.accountInfo.isEmailVerified = Boolean(obj.x);
     WalletStore.sendEvent('on_email_verified', obj.x);
@@ -104,7 +102,7 @@ MyWallet.getSocketOnMessage = function (message, lastOnChange) {
 // called by native websocket in iOS
 MyWallet.getSocketOnOpenMessage = function () {
   var accounts = MyWallet.wallet.hdwallet ? MyWallet.wallet.hdwallet.activeXpubs : [];
-  return MyWallet.ws.msgOnOpen(MyWallet.wallet.guid, MyWallet.wallet.activeAddresses, accounts);
+  return BlockchainSocket.onOpenSub(MyWallet.wallet.guid, MyWallet.wallet.activeAddresses, accounts);
 };
 
 // Fetch a new wallet from the server
@@ -128,7 +126,9 @@ MyWallet.getWallet = function (success, error) {
     MyWallet.decryptAndInitializeWallet(function () {
       MyWallet.wallet.getHistory();
 
-      if (success) success();
+      MyWallet.wallet.loadMetadata().then(function () {
+        if (success) success();
+      });
     }, function () {
       // When re-fetching the wallet after a remote update, if we can't decrypt
       // it, logout for safety.
@@ -180,12 +180,14 @@ MyWallet.decryptAndInitializeWallet = function (success, error, decryptSuccess, 
   );
 };
 
-// used in the frontend
+const PAIRING_CODE_PBKDF2_ITERATIONS = 10;
+
+// Used in the frontend / ios
 MyWallet.makePairingCode = function (success, error) {
   try {
     API.securePostCallbacks('wallet', { method: 'pairing-encryption-password' }, function (encryptionPhrase) {
       var pwHex = new Buffer(WalletStore.getPassword()).toString('hex');
-      var encrypted = WalletCrypto.encrypt(MyWallet.wallet.sharedKey + '|' + pwHex, encryptionPhrase, 10);
+      var encrypted = WalletCrypto.encrypt(MyWallet.wallet.sharedKey + '|' + pwHex, encryptionPhrase, PAIRING_CODE_PBKDF2_ITERATIONS);
       success('1|' + MyWallet.wallet.guid + '|' + encrypted);
     }, function (e) {
       error(e);
@@ -193,6 +195,83 @@ MyWallet.makePairingCode = function (success, error) {
   } catch (e) {
     error(e);
   }
+};
+
+MyWallet.parsePairingCode = function (pairingCode) {
+  if (pairingCode == null || pairingCode.length === 0) {
+    return Promise.reject('Invalid Pairing QR Code');
+  }
+
+  let [version, guid, encrypted] = pairingCode.split('|');
+
+  if (version !== '1') {
+    return Promise.reject('Invalid Pairing Version Code ' + version);
+  }
+
+  if (guid == null || guid.length !== 36) {
+    return Promise.reject('Invalid Pairing QR Code, GUID is invalid');
+  }
+
+  let data = {
+    guid,
+    format: 'plain',
+    method: 'pairing-encryption-password'
+  };
+
+  let requestSuccess = (encryptionPhrase) => {
+    let decrypted = WalletCrypto.decrypt(encrypted, encryptionPhrase, PAIRING_CODE_PBKDF2_ITERATIONS);
+    if (decrypted != null && decrypted.length) {
+      let [sharedKey, passwordHex] = decrypted.split('|');
+      let password = new Buffer(passwordHex, 'hex').toString('utf8');
+      return { version, guid, sharedKey, password };
+    } else {
+      return Promise.reject('Decryption Error');
+    }
+  };
+
+  let requestError = (res) => {
+    return Promise.reject('Pairing Code Server Error');
+  };
+
+  return API.request('POST', 'wallet', data).then(requestSuccess, requestError);
+};
+
+MyWallet.loginFromJSON = function (stringWallet, stringExternal, magicHashHexExternal, password) {
+  assert(stringWallet, 'Wallet JSON required');
+
+  // If metadata service returned 404, do not pass in a string.
+  var walletJSON = JSON.parse(stringWallet);
+  var externalJSON = stringExternal ? JSON.parse(stringExternal) : null;
+
+  MyWallet.wallet = new Wallet(walletJSON);
+  WalletStore.unsafeSetPassword(password);
+  setIsInitialized();
+  return MyWallet.wallet.loadMetadata({
+    external: externalJSON
+  }, {
+    external: magicHashHexExternal ? Buffer.from(magicHashHexExternal, 'hex') : null
+  });
+};
+
+MyWallet.checkForCompletedTrades = function (stringWallet, stringExternal, magicHashHexExternal, password, callback) {
+  MyWallet.loginFromJSON(stringWallet, stringExternal, magicHashHexExternal, password).then(() => {
+    let external = MyWallet.wallet.external;
+    let exchange = external.coinify.hasAccount
+      ? external.coinify : external.sfox.hasAccount
+      ? external.sfox : null;
+
+    if (exchange) {
+      exchange.debug = true;
+      let trades = exchange.trades;
+      if (trades.length) {
+        let pendingTrades = trades.filter(t => !t.bitcoinReceived);
+        pendingTrades.forEach((t) => t.watchAddress().then(() => callback(t)));
+        exchange._TradeClass._checkOnce(pendingTrades, exchange._delegate).then(() => {
+          external.save();
+        });
+      }
+    }
+  });
 };
 
 /* guid: the wallet identifier
@@ -222,7 +301,9 @@ MyWallet.login = function (guid, password, credentials, callbacks) {
 
   let initializeWallet = () => {
     return MyWallet.initializeWallet(password, cb('didDecrypt'), cb('didBuildHD'))
-      .then(() => ({ guid: guid }));
+      .then(() => {
+        return { guid: guid };
+      });
   };
 
   if (guid === WalletStore.getGuid() && WalletStore.getEncryptedWalletData()) {
@@ -277,7 +358,6 @@ MyWallet.initializeWallet = function (pw, decryptSuccess, buildHdSuccess) {
     }
 
     function _success () {
-      return;
     }
 
     function _error (e) {
@@ -302,14 +382,6 @@ MyWallet.initializeWallet = function (pw, decryptSuccess, buildHdSuccess) {
     );
   };
 
-  // Attempt to load metadata for buy-sell
-  var tryLoadExternal = function () {
-    var loadExternalFailed = function (message) {
-      console.warn('wallet.external not set:', message);
-    };
-    return MyWallet.wallet.loadExternal.bind(MyWallet.wallet)().catch(loadExternalFailed);
-  };
-
   var p = Promise.resolve().then(doInitialize);
   var incStats = function () {
     return MyWallet.wallet.incStats.bind(MyWallet.wallet)();
@@ -317,9 +389,12 @@ MyWallet.initializeWallet = function (pw, decryptSuccess, buildHdSuccess) {
   var saveGUID = function () {
     return MyWallet.wallet.saveGUIDtoMetadata();
   };
-  p.then(incStats);
-  p.then(saveGUID);
-  return p.then(tryLoadExternal);
+  var loadMetadata = function () {
+    return MyWallet.wallet.loadMetadata();
+  };
+  p.then(incStats).catch(() => { /* ignore failure */ });
+  p.then(saveGUID).catch(() => { /* ignore failure */ });
+  return p.then(loadMetadata);
 };
 
 // used on iOS
@@ -402,11 +477,13 @@ function syncWallet (successcallback, errorcallback) {
           // Include HD addresses unless in lame mode:
           var hdAddresses = [];
           if (MyWallet.wallet.hdwallet !== undefined && MyWallet.wallet.hdwallet.accounts !== undefined) {
+            var nAccounts = MyWallet.wallet.hdwallet.accounts.length;
+            var nAddresses = range(0, Helpers.addressesePerAccount(nAccounts));
             var subscribeAccount = function (acc) {
               var ri = acc.receiveIndex;
               var labeled = acc.labeledReceivingAddresses ? acc.labeledReceivingAddresses : [];
               var getAddress = function (i) { return acc.receiveAddressAtIndex(i + ri); };
-              return [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19].map(getAddress).concat(labeled);
+              return nAddresses.map(getAddress).concat(labeled);
             };
             hdAddresses = MyWallet.wallet.hdwallet.accounts.map(subscribeAccount).reduce(function (a, b) { return a.concat(b); }, []);
           }
@@ -464,6 +541,7 @@ MyWallet.syncWallet = Helpers.asyncOnce(syncWallet, 1500, function () {
  * @param {string} mnemonic: optional BIP 39 mnemonic
  * @param {string} bip39Password: optional BIP 39 passphrase
  */
+
  // used on mywallet, iOS and frontend
 MyWallet.createNewWallet = function (inputedEmail, inputedPassword, firstAccountName, languageCode, currencyCode, successCallback, errorCallback) {
   var success = function (createdGuid, createdSharedKey, createdPassword, sessionToken) {

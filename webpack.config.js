@@ -1,11 +1,11 @@
-
+const path = require('path');
 let webpack = require('webpack');
 let StringReplacePlugin = require('string-replace-webpack-plugin');
 
 let config = {
-  entry: './index.js',
+  entry: './src/index.js',
   output: {
-    path: 'dist',
+    path: path.resolve(__dirname, 'dist'),
     filename: 'my-wallet.js',
     library: 'Blockchain',
     libraryTarget: 'var'
@@ -39,14 +39,21 @@ let config = {
       }
     ]
   },
+  node: {
+    fs: 'empty'
+  },
   plugins: [
-    new StringReplacePlugin()
+    new StringReplacePlugin(),
+    new webpack.EnvironmentPlugin({
+      NODE_ENV: 'prod'
+    })
   ]
 };
 
 if (process.env.NODE_ENV === 'prod') {
   let uglifyPlugin = new webpack.optimize.UglifyJsPlugin({
     mangle: false,
+    compress: false,
     comments: false
   });
 
